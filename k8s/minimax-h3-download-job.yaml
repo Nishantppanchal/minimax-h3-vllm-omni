@@ -1,0 +1,43 @@
+# Optional: download MiniMax-H3 weights into the minimax-h3-weights PVC.
+# Requires: accepted license on Hugging Face, and
+#   kubectl -n minimax-h3 create secret generic hf-token --from-literal=token=hf_xxx
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minimax-h3-download
+  namespace: minimax-h3
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: download
+          image: python:3.12-slim
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef: {name: hf-token, key: token}
+            - name: HF_XET_HIGH_PERFORMANCE   # hf_transfer is removed in huggingface_hub 1.x
+              value: "1"
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              pip install -q -U huggingface_hub
+              # FL2VA only (T2VA + FL2VA). For the combined T2VA/FL2VA/Ref2VA
+              # service on 2x H200, append:
+              #   "Ref2VA/model_index.json" "Ref2VA/transformer/*"
+              hf download MiniMaxAI/MiniMax-H3 \
+                --include "model_index.json" "FL2VA/*" \
+                --local-dir /models/MiniMax-H3
+              # Turbo LoRA (optional, later): uncomment to fetch the 4-step adapter
+              # hf download lightx2v/Minimax-h3-Turbo \
+              #   minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors \
+              #   --local-dir /models/MiniMax-H3/Turbo-LoRA
+          volumeMounts:
+            - {name: weights, mountPath: /models}
+      volumes:
+        - name: weights
+          persistentVolumeClaim: {claimName: minimax-h3-weights}

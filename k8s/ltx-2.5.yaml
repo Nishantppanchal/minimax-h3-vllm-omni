@@ -1,0 +1,107 @@
+# LTX-2.5 distilled on vLLM-Omni: for a speed/quality bake-off against MiniMax-H3.
+# Docs: ../docs/08-model-comparison.md
+# Untested template: verify flags against the LTX-2.5 recipe for your image version.
+#
+# Default: 2x H200, distilled two-stage 1920x1088, Ulysses 2 (measured ~10.6 s per 5 s clip).
+# 2x H100: two-stage (~114 GB) does not fit per GPU under Ulysses, which replicates the
+#   model; use --tensor-parallel-size=2 instead of --usp=2, or run one-stage + FP8 per GPU.
+# Stop the H3 Deployment first if both target the same two GPUs.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ltx-weights
+  namespace: minimax-h3
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: CHANGE-ME
+  resources:
+    requests:
+      storage: 150Gi                   # ~70 GB BF16 file set + headroom
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ltx-25
+  namespace: minimax-h3
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: ltx-25}
+  template:
+    metadata:
+      labels: {app: ltx-25}
+    spec:
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H200   # adjust to your node's label
+      tolerations:
+        - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+      terminationGracePeriodSeconds: 120
+      enableServiceLinks: false
+      containers:
+        - name: vllm-omni
+          image: vllm/vllm-omni:v0.32.0@sha256:6b44ee504a0dc3a21eacf72e7dc5da318b7bcc8ed0e349dc928e67278414430c
+          command: ["vllm"]
+          args:
+            - serve
+            - /models/LTX-2.5-Diffusers
+            - --omni
+            - --host=0.0.0.0
+            - --port=8000
+            - --served-model-name=Lightricks/LTX-2.5-Diffusers
+            - --model-class-name=LTX2DistilledTwoStagePipeline
+            - --usp=2                       # match Ulysses degree to GPU count
+            - --vae-patch-parallel-size=2
+            - --vae-use-tiling
+            - --stage-init-timeout=900
+            # Faster, lower-res alternative (960x544, ~3.4 s per 5 s clip on 2x H200):
+            # - --model-class-name=LTX2DistilledOneStagePipeline
+          env:
+            - {name: VLLM_WORKER_MULTIPROC_METHOD, value: spawn}
+            - {name: HF_HUB_OFFLINE, value: "1"}
+          ports:
+            - {name: http, containerPort: 8000}
+          resources:
+            requests:
+              nvidia.com/gpu: 2
+              cpu: "8"
+              memory: 32Gi             # estimate; measure with kubectl top
+            limits:
+              nvidia.com/gpu: 2
+              memory: 128Gi
+          volumeMounts:
+            - {name: weights, mountPath: /models, readOnly: true}
+            - {name: dshm, mountPath: /dev/shm}
+            - {name: scratch, mountPath: /tmp}
+          startupProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 30
+            failureThreshold: 40       # up to 20 min
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 10
+      volumes:
+        - name: weights
+          persistentVolumeClaim: {claimName: ltx-weights}
+        - name: dshm
+          emptyDir: {medium: Memory, sizeLimit: 16Gi}
+        - name: scratch
+          emptyDir: {sizeLimit: 50Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ltx-25
+  namespace: minimax-h3
+spec:
+  selector: {app: ltx-25}
+  ports:
+    - {name: http, port: 8000, targetPort: http}

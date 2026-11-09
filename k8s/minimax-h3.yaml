@@ -1,0 +1,127 @@
+# MiniMax-H3 on vLLM-Omni: single node, 2x H100 or 2x H200
+# Docs: ../docs/04-kubernetes.md
+#
+# Before applying:
+#   1. kubectl create namespace minimax-h3
+#   2. Set storageClassName and the GPU nodeSelector below
+#      (kubectl get nodes -L nvidia.com/gpu.product).
+#   3. If the weights are not on the volume yet, also apply minimax-h3-download-job.yaml.
+#      If they live elsewhere, point the `weights` volume at them instead.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minimax-h3-weights
+  namespace: minimax-h3
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: CHANGE-ME          # fast local NVMe / high-throughput storage
+  resources:
+    requests:
+      storage: 250Gi                   # ~135 GB FL2VA only, ~200 GB with Ref2VA
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minimax-h3
+  namespace: minimax-h3
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate                     # a rolling update would need 4 GPUs at once
+  selector:
+    matchLabels: {app: minimax-h3}
+  template:
+    metadata:
+      labels: {app: minimax-h3}
+    spec:
+      nodeSelector:
+        # GPU Feature Discovery label; adjust to your node's value
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+      tolerations:
+        - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+      terminationGracePeriodSeconds: 120
+      enableServiceLinks: false
+      containers:
+        - name: vllm-omni
+          # v0.32.0 = current stable and :latest (as of 2026-11-09). Digest is the linux/amd64 image.
+          image: vllm/vllm-omni:v0.32.0@sha256:6b44ee504a0dc3a21eacf72e7dc5da318b7bcc8ed0e349dc928e67278414430c
+          command: ["vllm"]
+          args:
+            - serve
+            - /models/MiniMax-H3
+            - --omni
+            - --trust-remote-code
+            - --host=0.0.0.0
+            - --port=8000
+            - --served-model-name=MiniMaxAI/MiniMax-H3
+            # Remove the next line on 2x H200 to serve FL2VA + Ref2VA together
+            - --task-type=fl2va
+            - --num-gpus=2
+            - --tensor-parallel-size=2
+            - --usp=1
+            - --ring=1
+            - --text-encoder-tp-size=2
+            - --vae-patch-parallel-size=2
+            - --vae-parallel-mode=tile
+            - --vae-use-tiling
+            # Turbo LoRA (optional, later): uncomment both, and send the lora field per request
+            # - --lora-backend=peft
+            # - --lora-path=/models/MiniMax-H3/Turbo-LoRA/minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors
+            - --enforce-eager                # resident profiles can drop this for regional compile (first request = warmup)
+            # Hopper default attention is FLASH_ATTN; --diffusion-attention-backend=CUDNN_ATTN is the alternative to try
+            # If 1344x768 OOMs on H100: try FP8 first (DiT + text encoder, stays resident).
+            # - --quantization=fp8
+            # Still OOM? Add DLO too (FP8 + DLO is supported); needs the big-RAM node.
+            # - --enable-distributed-layerwise-offload
+            # - --dlo-no-use-allgather
+            # - --dlo-resident-layers=30
+          env:
+            - {name: VLLM_WORKER_MULTIPROC_METHOD, value: spawn}
+            - {name: VLLM_OMNI_VIDEO_SYNC_TIMEOUT, value: "14400"}
+            - {name: HF_HUB_OFFLINE, value: "1"}
+          ports:
+            - {name: http, containerPort: 8000}
+          resources:
+            requests:
+              nvidia.com/gpu: 2
+              cpu: "16"                # MP4 encoding runs on CPU
+              memory: 64Gi             # resident (no offload); measure and tune
+            limits:
+              nvidia.com/gpu: 2
+              memory: 160Gi            # includes /dev/shm + page cache. If you enable DLO or
+                                       # CPU offload: >=200 GiB free, 384 GiB node recommended
+          volumeMounts:
+            - {name: weights, mountPath: /models, readOnly: true}
+            - {name: dshm, mountPath: /dev/shm}
+            - {name: scratch, mountPath: /tmp}
+          startupProbe:                # loading + first compile can take many minutes
+            httpGet: {path: /health, port: http}
+            periodSeconds: 30
+            failureThreshold: 80       # up to 40 min
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 10
+      volumes:
+        - name: weights
+          persistentVolumeClaim: {claimName: minimax-h3-weights}
+        - name: dshm                   # replaces docker --ipc=host
+          emptyDir: {medium: Memory, sizeLimit: 32Gi}
+        - name: scratch                # uploaded references + MP4 temp files
+          emptyDir: {sizeLimit: 50Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minimax-h3
+  namespace: minimax-h3
+spec:
+  selector: {app: minimax-h3}
+  ports:
+    - {name: http, port: 8000, targetPort: http}
